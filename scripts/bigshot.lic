@@ -5,15 +5,44 @@
   hunting script for hunting
 
         author: elanthia-online
-  contributers: SpiffyJr, Tillmen, Kalros, Hazado, Tysong, Athias
+  contributers: SpiffyJr, Tillmen, Kalros, Hazado, Tysong, Athias, Falicor
           game: Gemstone
           tags: hunting
-       version: 3.92
+       version: 4.0
 
   Setup instructions: https://gswiki.play.net/Script_Bigshot
   To help contribute: https://github.com/elanthia-online/scripts
   Full Changelog: https://gswiki.play.net/Script_Bigshot_Changelog
-  
+
+  v4.0 (2020-08-13)
+    -Fix for ambush (Head/Neck/Eyes), no longer get stuck ambushing a head/neck over and over
+    -Archery Updates
+       Change aim location based on target actual status
+       BUGFIX:Aiming should now actually function as intended when switching targets
+       --TODO!Crossbows should now work with Bigshot, see pre-fire commands for details
+    -Group logic changes
+       Followers can now stay in the resting area and wait to run scripts/commands until leader is done
+          To do this, have the leader disband before running their scripts. With quiet followers selected
+          Followers attempt to not execute scripts/actions until the leader is in the rest area with them (regardless of disband)
+       Quiet Followers can be toggled off (not recommended)
+       Followers will now wait to cast signs until hunt is about to begin
+       Leader will no longer begin hunt until all followers are present and ready to go
+       --TODO!Leader will wait at rallypoint for entire group to arrive before moving to hunt starting room
+            If this feature is selected, the leader will not wait to hunt when at hunt starting room after rallypoint check
+       BUGFIX:Fix for fatal recursion cause by obvious hiding players
+       --TODO!Group should move more intelligently when seeking leader if group is broken
+       BUGFIX:Group will now be more responsive to commands
+
+    -Major UCS updates
+        BUGFIX:Will now use Tier 3 attack when tiered up to 3 and no follow up available for everything, not just jab
+        BUGFIX:Updates to UCS Mstrike, should no longer do open mstrikes when at or below threshhold instead of targetted mstrike
+        UCS mstrike threshold merged with MStrike tab threshold
+        --Still to be done: Per creature tier ups
+    -Bigshot now has the ability to turn some individual checks on and off
+          Functionality allows for custom hunting scripts to be built using Bigshot logic
+          Added ability to send custom "fput" to Group
+          Added ability to send custom "client_put" to Group
+
   v3.92 (2020-07-08)
     -Added LTE support for followers, overkill support for followers, & fried hunting commands for followers
   v3.91 (2020-06-16)
@@ -50,11 +79,15 @@
       ;bigshot profile save <name here, no spaces>
       Allows saving of bigshot profiles as YAML files, saved in your LICH\scripts\bigshot_profiles folder
 =end
-=begin  
+=begin
     To do:
       Add more messaging for ambush checks (snipe, etc.)
       Add Stun Relief (108)|Undisease (113)|Unpoison (114) option for stunned group members
       Add Hand of Tonis to dismiss clouds
+      Group logic for familiars/companions
+      UCS will frequently use the last '$bigshot_unarmed_followup_attack', needs to be cleared
+      Need support for tracking multiple NPC positioning tiers for UCS
+      Celerity (506) support from grouped wizards for MStrikes
 =end
 
 # Compatability for Older Ruby Versions
@@ -86,7 +119,7 @@ require 'yaml'
 require 'drb'
 
 # Alphabetized Global Variables
-BIGSHOT_VERSION = '3.92'
+BIGSHOT_VERSION = '3.93'
 RALLY_TIME = 1
 REST_INTERVAL = 60
 $bigshot_1614_list = []
@@ -97,6 +130,7 @@ $bigshot_ambush = 0
 $bigshot_archery_aim = 0
 $bigshot_archery_stuck_location = []
 $bigshot_archery_location = nil
+$bigshot_bandits = false
 $bigshot_bless = []
 $bigshot_debug = false
 $bigshot_flee = false
@@ -119,6 +153,7 @@ $last_loot=nil
 $not_hunting_reason = nil
 $rest_reason = nil
 $room_npcs_last_check=[]
+$mstrike_taken = false
 
 def spam
   def waitcastrt?
@@ -150,14 +185,13 @@ def unspam
 end
 
 bigshot_monitor = proc { |server_string|
-  if server_string =~ /<a exist="\d+" noun="([a-zA-Z]*?)">[a-zA-Z]*?<\/a> leaps from hiding to attack!/i
+  if !$bigshot_bandits && server_string =~ /<a exist="\d+" noun="([a-zA-Z]*?)">[a-zA-Z]*?<\/a> leaps from hiding to attack!/i
     temp = $1
     if !$grouplist.any?{|s| s =~ /#{temp}/i}
       $ambusher_here = true
     end
-  elsif server_string =~ /flies out of the shadows toward/i
-    if server_string =~ /flies out of the shadows toward you/i
-    elsif $grouplist.size == 0
+  elsif !$bigshot_bandits && server_string =~ /flies out of the shadows toward|A shadowy figure leaps from hiding to attack/i
+    if $grouplist.size == 0
       $ambusher_here = true
     end
   elsif server_string =~ /obvious signs of someone hiding/i
@@ -212,16 +246,18 @@ before_dying { unspam() }
 before_dying { $bigshot.gather_ammo }
 
 class Event
-  attr_accessor :type, :created_at, :room_id
-  @@RECOGNIZED = [ :HUNTING_PREP_COMMANDS, :HUNTING_SCRIPTS_START, :CAST_SIGNS, :ATTACK, :PREP_REST, 
-                   :HUNTING_SCRIPTS_STOP, :RESTING_SCRIPTS_START, :RESTING_PREP_COMMANDS, :DISPLAY_WATCH, 
-                   :FOLLOWER_OVERKILL ]
+  attr_accessor :type, :created_at, :room_id, :cmd_input
+  @@RECOGNIZED = [ :HUNTING_PREP_COMMANDS, :HUNTING_SCRIPTS_START, :CAST_SIGNS, :ATTACK, :PREP_REST,
+                   :HUNTING_SCRIPTS_STOP, :RESTING_SCRIPTS_START, :RESTING_PREP_COMMANDS, :DISPLAY_WATCH,
+                   :FOLLOWER_OVERKILL, :STAY_QUIET, :FOLLOW_NOW, :LOOT, :CUSTOM_PUT, :CUSTOM_CMD, :CUSTOM_DO_CLIENT,
+                   :PUBLIC_SEND ]
 
-  def initialize( type, time_stamp, room_id )
+  def initialize( type, time_stamp, room_id, c_in = nil )
     raise "Event type not recognized" unless @@RECOGNIZED.include?(type)
     @type       = type
     @created_at = time_stamp
     @room_id    = room_id
+    @cmd_input = c_in
   end
 
   def stale?
@@ -265,6 +301,17 @@ class Group
     return @leader.room_id()
   end
 
+  def obv_hide_reset()
+    @members.each_pair { |k,v|
+      begin
+        v.reset_obvious_hiding_player()
+      rescue
+        @leader.message("Error polling member. Removing!")
+        @members.delete(k)
+      end
+    }
+  end
+
   def add_event(type)
     @members.each_pair { |k,v|
       begin
@@ -274,6 +321,18 @@ class Group
         @leader.message($!.backtrace.join("\n"))
       end
     }
+  end
+
+  def has_bandit_bounty?()
+    @members.each_pair { |k,v|
+      begin
+        return true if v.cur_bounty =~ /suppress bandit activity (?:in|on|near|between|under) (?:the )?(.*)\s(?:near|between|under|\.).* (\d+)/
+      rescue
+        @leader.message("Error polling member. Removing!")
+        @members.delete(k)
+      end
+    }
+    return false
   end
 
   def group_assist( should_attack )
@@ -291,6 +350,10 @@ class Group
     @leader.add_event( Event.new(event) ) unless @leader.event_stack.size > 5
   end
 
+  def resting_id()
+    return @leader.RESTING_ROOM_ID
+  end
+
   def roundtime?()
     @members.each_pair { |k,v|
       begin
@@ -303,10 +366,69 @@ class Group
     return false
   end
 
+  #Use this to perform combat actions
+  def do_command(command_input)
+     @members.each_pair { |k,v|
+      begin
+        v.add_event( :CUSTOM_CMD, Time.now.to_i, Room.current.id, command_input )
+      rescue
+        @leader.message("Error polling member. Removing!")
+        @members.delete(k)
+      end
+    }
+  end
+
+  #Use this to perform non-combat actions
+  def do_put(command_input)
+    @members.each_pair { |k,v|
+     begin
+       v.add_event( :CUSTOM_PUT, Time.now.to_i, Room.current.id, command_input )
+     rescue
+       @leader.message("Error polling member. Removing!")
+       @members.delete(k)
+     end
+   }
+ end
+
+ #Use this to perform perform actions as if they were typed through the client
+  def client_do(command_input)
+    @members.each_pair { |k,v|
+     begin
+       v.add_event( :CUSTOM_DO_CLIENT, Time.now.to_i, Room.current.id, command_input )
+     rescue
+       @leader.message("Error polling member. Removing!")
+       @members.delete(k)
+     end
+   }
+  end
+
+   #Use this to perform perform actions as if they were typed through the client
+   def pub_send(command_input)
+    @members.each_pair { |k,v|
+     begin
+       v.add_event( :PUBLIC_SEND, Time.now.to_i, Room.current.id, command_input )
+     rescue
+       @leader.message("Error polling member. Removing!")
+       @members.delete(k)
+     end
+   }
+  end
+
+  def clear_group_events()
+    @members.each_pair { |k,v|
+     begin
+       v.clear_events()
+     rescue
+       @leader.message("Error polling member for RT. Removing!")
+       @members.delete(k)
+     end
+   }
+  end
+
   def should_hunt?()
     emergency = @leader.event_stack.size == 0 ? nil : @leader.event_stack.shift
     if(emergency)
-      @leader.clear_events
+      @leader.clear_events()
       return false
     end
 
@@ -322,10 +444,33 @@ class Group
     return true
   end
 
+  def group_bandit_hunting( kill_bandits )
+    @members.each_pair { |k,v|
+      begin
+        v.set_bandit_hunting(kill_bandits)
+      rescue
+        @leader.message("Error polling member. Removing!")
+        @members.delete(k)
+      end
+    }
+  end
+
   def should_rest?()
     @members.each_pair { |k,v|
       begin
         return false if !v.should_rest?
+      rescue
+        @leader.message("Error polling member. Removing!")
+        @members.delete(k)
+      end
+    }
+    return true
+  end
+
+  def all_present?
+    @members.each_pair { |k,v|
+      begin
+        return false if !checkpcs.include?(k) && k != @leader.name
       rescue
         @leader.message("Error polling member. Removing!")
         @members.delete(k)
@@ -358,24 +503,24 @@ class Bigshot
     :DISABLE_COMMANDS, :HUNTING_STANCE, :HUNTING_PREP_COMMANDS,
     :MONITOR_INTERACTION, :FLEE_CLOUDS, :FLEE_VINES, :FLEE_WEBS, :WRACKING_SPIRIT,
     :REST_TILL_SPIRIT, :BOUNTY_MODE, :AMBUSH, :ARCHERY_AIM,
-    :event_stack, :followers, :BLESS, :AIM, :TIER3, 
-    :MSTRIKE_COOLDOWN, :MSTRIKE_STAMINA_COOLDOWN, :MSTRIKE_MOB, 
+    :event_stack, :followers, :BLESS, :AIM, :TIER3, :QUIET_FOLLOWERS,
+    :MSTRIKE_COOLDOWN, :MSTRIKE_STAMINA_COOLDOWN, :MSTRIKE_MOB,
     :MSTRIKE_QUICKSTRIKE, :MSTRIKE_STAMINA_QUICKSTRIKE,
     :UAC_MSTRIKE, :WANDER_WAIT, :QUICK_COMMANDS, :PRIORITY,
     :QUICKHUNT_TARGETS, :UAC_SMITE, :FOG_RETURN, :LOOT_STANCE,
-    :DELAY_LOOT, :PULL, :OVERKILL, :LTE_BOOST, :help_group_kill
+    :DELAY_LOOT, :PULL, :OVERKILL, :LTE_BOOST, :HELP_GROUP_KILL
 
   PRONE = /sleeping|webbed|stunned|kneeling|sitting|^lying|prone|frozen|held in place/
 
-  def add_event( type, time_stamp, room_id )
+  def add_event( type, time_stamp, room_id, c_in = nil )
     echo "add_event" if $bigshot_debug
     unless( @event_stack.size > 5 && type == :ATTACK )
       if( type == :FOLLOWER_OVERKILL )
         add_overkill()
-        @event_stack.push( Event.new( type, time_stamp, room_id ) ) unless( @event_stack.any? { |a| a.type == type} )
-      else  
-        @event_stack.push( Event.new( type, time_stamp, room_id ) )
-      end  
+        @event_stack.push( Event.new( type, time_stamp, room_id, c_in ) ) unless( @event_stack.any? { |a| a.type == type} )
+      else
+        @event_stack.push( Event.new( type, time_stamp, room_id, c_in ) )
+      end
     end
   end
 
@@ -392,7 +537,7 @@ class Bigshot
   def initialize(bounty_mode=nil)
     echo "initialize" if $bigshot_debug
     $bigshot = self
-    @help_group_kill = true
+    @HELP_GROUP_KILL = true
     if bounty_mode
       @BOUNTY_MODE = true
     end
@@ -484,7 +629,6 @@ class Bigshot
     set_value( 'archery_aim',                  'split',     Array.new  )
     set_value( 'tier3',                        '',          'punch'    )
     set_value( 'bless',                        '',          nil        )
-    set_value( 'uac_mstrike',                  'to_i',      1          )
     set_value( 'uac_smite',                    '',          false      )
     set_value( 'wander_wait',                  'to_f',      0.3        )
     set_value( 'priority',                     '',          false      )
@@ -494,6 +638,7 @@ class Bigshot
     set_value( 'pull',                         '',          true       )
     set_value( 'overkill',                     'to_i',      0          )
     set_value( 'lte_boost',                    'to_i',      0          )
+    set_value( 'quiet_followers',              '',          true       )
   end
 
   def clean_value( clean, value )
@@ -563,7 +708,7 @@ class Bigshot
   end
 
   def cmd( command, npc = nil, stance_dance = true )
-    echo "cmd" if $bigshot_debug
+    echo "cmd #{command}" if $bigshot_debug
     GameObj.pcs.each {|s| if s.status =~ /kneeling|sitting|^lying|prone/;fput "pull #{s.noun}";end;} if GameObj.npcs.any? {|s| s.type =~ /aggressive npc/} && @PULL
     command = command.dup
 
@@ -575,7 +720,7 @@ class Bigshot
     if( command.class.to_s == 'Array' )
       stance_dance = false if command.any? { |j| j =~ /stance/ }
       command.each do |i|
-        break if npc.status =~ /dead/ || !GameObj.npcs.any? {|s| s.id == npc.id}
+        break if npc.status =~ /dead|gone/ || !GameObj.npcs.any? {|s| s.id == npc.id}
         echo i if $bigshot_debug
         cmd( i, npc, stance_dance )
       end
@@ -672,11 +817,11 @@ class Bigshot
     command.gsub!( /target/, "##{npc.id}" ) if !npc.nil?
 
     # Soothe routine
-    if Spell[1205].known? && Spell[1205].affordable?
+    if Spell[1201].known? && Spell[1201].affordable?
       if (Spell[201].active? || Spell[216].active? || Spell[1015].active? || Spell[1016].active? || Spell[1108].active? || Spell[1120].active?)
         waitrt?
         waitcastrt?
-        Spell[1205].cast
+        Spell[1201].cast
       end
     end
 
@@ -704,7 +849,7 @@ class Bigshot
       change_stance(@HUNTING_STANCE) if stance_dance
     end
 
-    return if (npc && !valid_target?(npc)) or npc.status =~ /dead/
+    return if (npc && !valid_target?(npc)) or npc.status =~ /dead|gone/
     return if @PRIORITY && !priority(npc)
 
     if( command =~ /^(incant)?\s?(\d+)\s?((?:open|closed)?\s?(?:cast|channel|evoke)?\s?(?:cast|channel|evoke)?\s?(?:open|closed)?\s?(?:air|earth|fire|lightning|water|cold)?)?.*$/i )
@@ -750,7 +895,7 @@ class Bigshot
 
   def volnsmite(npc)
     echo "volnsmite" if $bigshot_debug
-    while !$bigshot_smite_list.any?{|a| a.to_i == npc.id.to_i} && npc.status !~ /dead/ && GameObj.npcs.any? {|s| s.id == npc.id} && !should_flee? && (npc.type.split(',').any?{|a| a == "undead"} || npc.type.split(',').any?{|a| a == "noncorporeal"})
+    while !$bigshot_smite_list.any?{|a| a.to_i == npc.id.to_i} && npc.status !~ /dead|gone/ && GameObj.npcs.any? {|s| s.id == npc.id} && !should_flee? && (npc.type.split(',').any?{|a| a == "undead"} || npc.type.split(',').any?{|a| a == "noncorporeal"})
       res = dothistimeout "smite ##{npc.id}", 1, /^Roundtime|^What were you referring to\?$/
       if res =~ /^What were you referring to\?$/i
         break
@@ -762,31 +907,22 @@ class Bigshot
   def unarmed( command , npc, manualaim)
     echo "unarmed" if $bigshot_debug
 
-    return if npc.status =~ /dead/ || !GameObj.npcs.any? {|s| s.id == npc.id}
+    return if npc.status =~ /dead|gone/ || !GameObj.npcs.any? {|s| s.id == npc.id}
     $bigshot_aim = -1 if manualaim != "" && $bigshot_aim == 0
-    mstrike_taken = false
+    $mstrike_taken = false
     volnsmite(npc) if !$bigshot_smite_list.any?{|a| a.to_i == npc.id.to_i} && npc.type.split(',').any?{|a| a == "noncorporeal"} && $bigshot_unarmed_tier == 3 && Spell[9821].known? && @UAC_SMITE
-    mstrike_spell_check() if Char.prof =~ /Paladin|Empath/i && Skills.multiopponentcombat >= 5
-    if Skills.multiopponentcombat >= 5 && GameObj.npcs.all? { |i| i.noun !~ /nest/i }
       #9005 - Mstrike recovery
       #9699 - popped muscles
-      if (!Spell[9005].active? || (@MSTRIKE_COOLDOWN && checkstamina >= @MSTRIKE_STAMINA_COOLDOWN))
-        if (GameObjNpcCheck() >= @UAC_MSTRIKE)
-          if (checkstamina >= @MSTRIKE_STAMINA_QUICKSTRIKE || GameObjNpcCheck() >= @UAC_MSTRIKE) && !Spell[9699].active?
-            mstrike_taken = true
-            if command =~ /jab/ && $bigshot_unarmed_tier == 3 && $bigshot_unarmed_followup == false
-              cmd("mstrike #{@TIER3}", npc)
-            elsif $bigshot_unarmed_followup == true
-              cmd("mstrike #{$bigshot_unarmed_followup_attack}", npc)
-            else
-              cmd("mstrike #{command}", npc)
-            end
-          end
-        end
-      end
+    if $bigshot_unarmed_tier == 3 && $bigshot_unarmed_followup == false #command =~ /jab/ &&
+      cmd("mstrike #{@TIER3}", npc)
+    elsif $bigshot_unarmed_followup == true
+      cmd("mstrike #{$bigshot_unarmed_followup_attack}", npc)
+    else
+      cmd("mstrike #{command}", npc)
     end
-    if mstrike_taken == false
-      if command =~ /jab/ && $bigshot_unarmed_tier == 3 && $bigshot_unarmed_followup == false
+    pause 0.3
+    if( !$mstrike_taken )
+      if $bigshot_unarmed_tier == 3 && $bigshot_unarmed_followup == false #command =~ /jab/ &&
         if manualaim != ""
           cmd("#{@TIER3} ##{npc.id} #{manualaim}", npc)
         elsif !@AIM[$bigshot_aim].nil?
@@ -838,26 +974,29 @@ class Bigshot
         $bigshot_aim += 1
         cmd("#{command} ##{npc.id} #{@AIM[$bigshot_aim]}", npc)
       elsif line =~ /does not have/
-        $bigshot_aim += 10
+        $bigshot_aim += 1
         cmd("#{command} ##{npc.id} #{@AIM[$bigshot_aim]}", npc)
       elsif line =~ /Roundtime:/i
         $bigshot_aim = 0
         break
-      elsif line =~ /^Try standing up first\.$|[wW]ait \d+ sec.*|You currently have no valid target\.  You will need to specify one\.|^It looks like somebody already did the job for you\.$|^What were you referring to\?$|Sorry,|You can't do that while entangled in a web|You are still stunned|from here\.  Perhaps you should try throwing or shooting something at it\./
+      elsif line =~ /^Try standing up first\.$|[wW]ait \d+ sec.*|Sorry,|You can't do that while entangled in a web|You are still stunned|from here\.  Perhaps you should try throwing or shooting something at it\./
         break
       elsif line =~ /You don't seem to be able to move to do that\./
         sleep(2)
         break
       elsif line =~ /You are unable to muster the will to attack anything\.|Your rage causes you to use all of your skill in an all out attack!/
-        Spell[1205].cast if Spell[1205].known? && Spell[1205].affordable?
+        Spell[1201].cast if Spell[1201].known? && Spell[1201].affordable?
         break
-      elsif npc.status =~ /dead/ || !GameObj.npcs.any? {|s| s.id == npc.id} || should_flee? || should_rest?
+      elsif npc.status =~ /dead|gone/ || !(GameObj.npcs.any? {|s| s.id == npc.id}) || should_flee? || should_rest? || line =~/You currently have no valid target\.  You will need to specify one\.|^It looks like somebody already did the job for you\.$|What were you referring to/
+        $bigshot_unarmed_tier = 1
+        $bigshot_unarmed_followup = false
+        $bigshot_unarmed_followup_attack = ""
         break
       elsif timeNow < Time.now
         break
       end
     end
-    mstrike_taken = false
+    $mstrike_taken = false
   end
 
   def cmd_bless()
@@ -924,14 +1063,14 @@ class Bigshot
       return if GameObj.npcs.size.nil? || GameObjNpcCheck() == 0
       return if should_flee?
       return if should_rest?
-      return if npc.status =~ /dead/ || !GameObj.npcs.any? {|s| s.id == npc.id}
+      return if npc.status =~ /dead|gone/ || !GameObj.npcs.any? {|s| s.id == npc.id}
       return if ( Time.now - start ) > 30
     }
   end
 
   def cmd_weed( command, target )
     echo "cmd_weed" if $bigshot_debug
-    return if target.status =~ /dead/ || !GameObj.npcs.any? {|s| s.id == target.id}
+    return if target.status =~ /dead|gone/ || !GameObj.npcs.any? {|s| s.id == target.id}
     return if GameObj.loot.find { |loot| loot.name =~ /vine/ }
     return unless Spell[610].known? and Spell[610].affordable?
 
@@ -954,7 +1093,7 @@ class Bigshot
     return if id == 608 and hiding?
     return if id == 703 and $bigshot_703_list.any? {|s| s == target.id}
     return if id == 1614 and $bigshot_1614_list.any? {|s| s == target.id}
-    return if target.status =~ /dead/ || !GameObj.npcs.any? {|s| s.id == target.id}
+    return if target.status =~ /dead|gone/ || !GameObj.npcs.any? {|s| s.id == target.id}
     unless( Spell[id].affordable? )
       if(@WAND_IF_OOM)
         cmd_wand(target); return;
@@ -1077,28 +1216,59 @@ class Bigshot
             bs_put "#{command} ##{target.id}"
           end
         end
+        $mstrike_taken = true
       end
-    elsif Skills.multiopponentcombat >= 5 && GameObj.npcs.all?{ |i| i.noun !~ /nest/i }
+    elsif Skills.multiopponentcombat >= 5 && GameObj.npcs.all?{ |i| i.noun !~ /nest/i } && GameObjNpcCheck() >= @MSTRIKE_MOB
       if (!Spell[9005].active? || (@MSTRIKE_COOLDOWN && checkstamina >= @MSTRIKE_STAMINA_COOLDOWN))
         if @MSTRIKE_QUICKSTRIKE && checkstamina >= @MSTRIKE_STAMINA_QUICKSTRIKE && !Spell[9699].active?
           bs_put "quickstrike 1 #{command}"
         else
           bs_put "#{command}"
         end
+        $mstrike_taken = true
       end
+    end
+  end
+
+  def checkTargetVitals(command, target, ranged = false)
+    #General logic for this taken from ;fire by Oweodry
+    fput "look ##{target.id}"
+    loc = (ranged) ? $bigshot_archery_aim : $bigshot_ambush
+	  woundinfo = matchtimeout(1, /(he|she|it) has .*/i)
+    if ( command[loc] == "head" && woundinfo =~ /severe head trauma and bleeding from .* ears/ )
+      $bigshot_ambush += 1 if !ranged
+      $bigshot_archery_aim += 1 if ranged
+    elsif ( command[loc] == "neck" && woundinfo =~ /snapped bones and serious bleeding from .* neck/ )
+      $bigshot_ambush += 1 if !ranged
+      $bigshot_archery_aim += 1 if ranged
+    elsif ( command[loc] == "left eye" && woundinfo =~ /blinded left eye/ )
+      $bigshot_ambush += 1 if !ranged
+      $bigshot_archery_aim += 1 if ranged
+    elsif ( command[loc] == "right eye" && woundinfo =~ /blinded right eye/ )
+      $bigshot_ambush += 1 if !ranged
+      $bigshot_archery_aim += 1 if ranged
     end
   end
 
   def cmd_ranged(npc)
     echo "cmd_ranged" if $bigshot_debug
+    if npc.status =~ /dead|gone/ || !GameObj.npcs.any? {|s| s.id == npc.id}
+      $bigshot_archery_aim = 0
+      $bigshot_archery_stuck_location = []
+      return
+    end
     if !@ARCHERY_AIM[$bigshot_archery_aim].nil?
       if $bigshot_archery_stuck_location.any? { |s| s =~ /#{$bigshot_archery_location}/i }
         $bigshot_archery_aim += 1
-        if $bigshot_archery_aim > @ARCHERY_AIM.length
-          $bigshot_archery_aim = 0
-          $bigshot_archery_stuck_location = []
-        end
       end
+      if ( @ARCHERY_AIM[$bigshot_archery_aim] == "head" || @ARCHERY_AIM[$bigshot_archery_aim] == "neck" || @ARCHERY_AIM[$bigshot_archery_aim] == "left eye" || @ARCHERY_AIM[$bigshot_archery_aim] == "right eye" )
+        checkTargetVitals(@ARCHERY_AIM, npc, true)
+      end
+      if $bigshot_archery_aim > @ARCHERY_AIM.length
+        $bigshot_archery_aim = 0
+        $bigshot_archery_stuck_location = []
+      end
+
       if @ARCHERY_AIM[$bigshot_archery_aim] !~ /#{$bigshot_archery_location.to_s}/i || $bigshot_archery_location.nil?
         fput "aim #{@ARCHERY_AIM[$bigshot_archery_aim]}"
       end
@@ -1116,7 +1286,7 @@ class Bigshot
       end
     end
 
-    result = dothistimeout("fire ##{npc.id}", 2, /You fire|You cannot|Could not find|seconds|Get what?/)
+    result = dothistimeout("fire ##{npc.id}", 2, /round(time)?|You cannot|Could not find|seconds|Get what?/i)
     if( result =~ /^Could not find/ )
       gather_ammo()
     elsif( result =~ /You cannot fire/ )
@@ -1134,6 +1304,9 @@ class Bigshot
     elsif ( result == false )
       $bigshot_should_rest = true
       $rest_reason = "Unknown result from fire routine: #{result}"
+    elsif result =~ /round(time)?/i
+      $bigshot_archery_aim = 0
+      $bigshot_archery_stuck_location = []
     end
   end
 
@@ -1165,19 +1338,30 @@ class Bigshot
     time.to_i.times do
       sleep(1)
       break if should_rest?
-      break if npc && npc.status =~ /dead/
+      break if npc && npc.status =~ /dead|gone/
     end
   end
 
   def cmd_ambush(command, target)
     echo "cmd_ambush" if $bigshot_debug
-    return if target.status =~ /dead/ || !GameObj.npcs.any? {|s| s.id == target.id}
+    if target.status =~ /dead|gone/ || !GameObj.npcs.any? {|s| s.id == target.id}
+      $bigshot_ambush = 0
+      return
+    end
     command = ["head", "right leg", "left leg", "chest"] if (command == "" || command.nil?) && @AMBUSH == []
     command = @AMBUSH if (command == "" || command == [] || command.nil?) && @AMBUSH != []
     command = [command] if command.class == String
+    if ( $bigshot_ambush >=  command.length() )
+      #If you have gotten here, there is nothing left to target on your list.
+      $bigshot_ambush = 0
+      command = ["chest"]
+    end
+    if ( command[$bigshot_ambush] == "head" || command[$bigshot_ambush] == "neck" || command[$bigshot_ambush] == "left eye" || command[$bigshot_ambush] == "right eye" )
+      checkTargetVitals(command, target)
+    end
     waitrt?
-    result = dothistimeout "ambush ##{target.id} #{command[$bigshot_ambush]}", 2, /round(time)?|You cannot aim that high!|is already missing that!/i
-    if result =~ /You cannot aim that high!|is already missing that!/i
+    result = dothistimeout "ambush ##{target.id} #{command[$bigshot_ambush]}", 2, /round(time)?|You cannot aim that high!|does not have a head!|is already missing that!|does not have a .* leg!|does not have a .* arm!/i
+    if result =~ /You cannot aim that high!|does not have a head!|is already missing that!|does not have a (?:right|left) leg!|does not have a (?:right|left) arm!/i
       $bigshot_ambush += 1
       cmd_ambush(nil, target)
     elsif result =~ /round(time)?/i
@@ -1300,7 +1484,7 @@ class Bigshot
   end
 
   def GameObjNpcCheck()
-    npcs = GameObj.npcs.find_all { |i| i.status !~ /dead/ }
+    npcs = GameObj.npcs.find_all { |i| i.status !~ /dead|gone/ }
     npcs.delete_if { |npc| CharSettings['untargetable'].include?(npc.name) }
     npcs.delete_if { |npc| npc.noun =~ /child|traveller|scribe|merchant|dignitary|official|magistrate/i && npc.name !~ /ethereal|celestial|unworldly/i }
     return npcs.size.to_i
@@ -1324,6 +1508,15 @@ class Bigshot
     elsif Spell[9813].known? && !Spell[9048].active?
       Spell[9813].cast
     end
+  end
+
+  def cur_bounty()
+    return bounty?
+  end
+
+  def set_bandit_hunting( kill_bandits )
+    #Need to circumvent anti-poach and protections some to hunt bandits
+    $bigshot_bandits = kill_bandits
   end
 
   def change_stance( new_stance, force = true )
@@ -1419,7 +1612,12 @@ class Bigshot
     echo "stand" if $bigshot_debug
     until(standing?)
       change_stance('defensive')
-      bs_put 'stand'
+      if (Char.name =~ /Falicor/)
+        bs_put 'stand robes'
+      else
+        bs_put 'stand'
+      end
+
     end
   end
 
@@ -1462,7 +1660,8 @@ class Bigshot
 
   def find_routine(target)
     echo "find_routine" if $bigshot_debug
-    if( !solo? && fried? && !@DISABLE_COMMANDS.size == 0 )
+    echo "@DISABLE_COMMANDS.size = #{@DISABLE_COMMANDS.size}" if $bigshot_debug
+    if( !solo? && fried? && @DISABLE_COMMANDS.size > 0 )
       return @DISABLE_COMMANDS
     else
       key = @TARGETS.keys.find { |k| target.name =~ /^#{k}$/i or target.noun =~ /^#{k}$/i }
@@ -1472,7 +1671,7 @@ class Bigshot
         routine_letter = @TARGETS[key]
       end
 
-      if routine_letter == 'quick'
+      if routine_letter == 'quick' || $bigshot_quick
         return @QUICK_COMMANDS unless @QUICK_COMMANDS.size == 0
       elsif routine_letter == 'j'
         return @HUNTING_COMMANDS_J unless @HUNTING_COMMANDS_J.size == 0
@@ -1516,18 +1715,20 @@ class Bigshot
   end
 
   def no_players()
+    echo "no_players" if $bigshot_debug
     if ((checkpcs - $grouplist).count > 0)
       return false
       echo "no_players: checkpcs present" if $bigshot_debug
     elsif GameObj.loot.find { |obj| obj.noun == 'disk' and obj.name !~ /#{Char.name}/}
-      return false
+    #This can cause poaching if you walk into a room with your disk already present.  Need to find a workaround
       echo "no_players: GameObj disk present" if $bigshot_debug
+      return false
     elsif $ambusher_here
+      echo "no_players: Ambusher here" if $bigshot_debug
       return false
-    echo "no_players: Ambusher here" if $bigshot_debug
     elsif $obvious_hiding_player
-      return false
       echo "no_players: Obvious Hiding Player here" if $bigshot_debug
+      return false
     else
       return true
     end
@@ -1540,10 +1741,16 @@ class Bigshot
     return true
   end
 
-  def pre_hunt()
+  def pre_hunt(manually_walking = false)
     echo "pre_hunt" if $bigshot_debug
+    if (!solo? && leading?)
+      @followers.group_assist( true )
+    end
     # prep/go
+    print "\a" unless $bigshot_quick
+    print "\a" unless $bigshot_quick
     @followers.add_event(:HUNTING_PREP_COMMANDS)
+
     @HUNTING_PREP_COMMANDS.each { |i|
       if i =~ /^script\s+(.*?)(\s|$)(.*)/i
         cmd_run_script( $1, $3 )
@@ -1552,20 +1759,28 @@ class Bigshot
         sleep(0.3)
       end
     }
-
-    @followers.add_event(:CAST_SIGNS)
-    cast_signs()
+    prepare_for_movement()
+    @followers.obv_hide_reset()
+    #@followers.add_event(:CAST_SIGNS)
+    #cast_signs()
 
     @followers.add_event(:HUNTING_SCRIPTS_START)
     run_scripts( @HUNTING_SCRIPTS, false )
 
-    if !$bigshot_quick
+    if !$bigshot_quick && !manually_walking
       goto(@HUNTING_ROOM_ID)
     end
-    if( !solo? && @followers.get_names.any? { |i| !checkpcs.include?(i) } )
-      @followers.add_event(:CAST_SIGNS) # trigger rubber band
-      sleep(10) # wait for followers
+    if( !solo? && leading? )
+      @followers.add_event(:FOLLOW_NOW) # trigger rubber band
+      while (!@followers.all_present?)
+        message("Waiting for followers....")
+        sleep(REST_INTERVAL/5)
+      end
+      GameObj.pcs.each {|s| if s.status =~ /kneeling|sitting|^lying|prone/;fput "pull #{s.noun}";end;} if GameObj.npcs.any? {|s| s.type =~ /aggressive npc/} && @PULL
+      @followers.add_event(:CAST_SIGNS)
+      prepare_for_movement()
     end
+    cast_signs()
   end
 
   def do_hunt()
@@ -1586,7 +1801,6 @@ class Bigshot
         echo "inside do_hunt loop" if $bigshot_debug
         echo target if $bigshot_debug
         target = find_target(nil) if @PRIORITY && !priority(target)
-        echo "Priority target switch to #{target}" if $bigshot_debug && @PRIORITY
         if( (Time.now.to_i - last_attack > 15) || just_arrived )
           @followers.add_event(:ATTACK)
           last_attack = Time.now.to_i
@@ -1595,14 +1809,13 @@ class Bigshot
         just_arrived = false
         loot() if $ambusher_here == false
       end
-
+      #prepare_for_movement()
       echo "Exiting attack loop" if $bigshot_debug
       gather_ammo()
 
       if(should_rest?)
         break
       else
-        prepare_for_movement()
         target = bs_wander()
         just_arrived = true
       end
@@ -1633,6 +1846,7 @@ class Bigshot
 
     # prep/go
     prepare_for_movement()
+    reset_obvious_hiding_player()
     if (@FOG_RETURN.to_i != 0)
       sleep(0.5)
       waitcastrt?
@@ -1664,7 +1878,6 @@ class Bigshot
         end
       end
     end
-    goto(@RESTING_ROOM_ID)
 
     # resetting overkill counter
     $bigshot_overkill_counter = 0
@@ -1675,8 +1888,21 @@ class Bigshot
     @followers.add_event(:HUNTING_SCRIPTS_STOP)
     croak_scripts(@HUNTING_SCRIPTS)
 
+    goto(@RESTING_ROOM_ID)
+    if ( @QUIET_FOLLOWERS )
+      @followers.add_event(:STAY_QUIET)
+    else
+      @followers.add_event(:FOLLOW_NOW)
+    end
+    while (!@followers.all_present?)
+      message("Waiting for followers....")
+      sleep(REST_INTERVAL/5)
+    end
+    #Stops followers from doing things like using waggle while the leader is selling loot.
+
+
     @followers.add_event(:RESTING_PREP_COMMANDS)
-    @RESTING_COMMANDS.each { |i| 
+    @RESTING_COMMANDS.each { |i|
       fput(i)
       sleep(0.3)
     }
@@ -1691,7 +1917,7 @@ class Bigshot
 
     if (!solo? && leading?)
       @followers.group_assist( true )
-    end  
+    end
     # loop
     until(should_hunt?)
       @followers.add_event(:DISPLAY_WATCH)
@@ -1704,7 +1930,7 @@ class Bigshot
       sleep(REST_INTERVAL)
     end
 
-    hunt()
+    hunt() if !$bigshot_bandits
   end
 
   def attack(target)
@@ -1717,22 +1943,24 @@ class Bigshot
       break if wounded? || $bigshot_should_rest
       break if $ambusher_here
       break if $obvious_hiding_player
-      break if target.status =~ /dead/ || !GameObj.npcs.any? {|s| s.id == target.id}
+      temp_var = !GameObj.npcs.any? {|s| s.id == target.id}
+      break if target.status =~ /dead|gone/ || temp_var
       break if should_flee?
       break if should_rest?
-      break if @PRIORITY && !priority(target)
+      break if !($bigshot_bandits) && @PRIORITY && !priority(target)
       stand() if !standing?
       cast_signs()
 
       cmd( i, target )
     end
-    echo commands.size if $bigshot_debug
+    echo  "commands.size = #{commands.size}" if $bigshot_debug
     #sleep 1 if commands.size == 0
   end
 
   def goto(id)
     echo "goto" if $bigshot_debug
     prepare_for_movement()
+    reset_obvious_hiding_player()
     until( Room.current.id == id )
       run_script( 'go2', true, [ id, '_disable_confirm_' ] )
     end
@@ -1796,9 +2024,13 @@ class Bigshot
     if($bigshot_quick && $grouplist.size > 0)
       return false
     elsif(leading?)
+      message "Obvious hiding player present" if $obvious_hiding_player
+      return true if $obvious_hiding_player
       (checkpcs - $grouplist).each { |i| return true unless @followers.get_names.include?(i) }
       if solo? && !$bigshot_quick
-        GameObj.npcs.each { |i| return true if i.type =~ /companion/ && i.name !~ /#{$companion}/i } 
+        message "Obvious hiding player present" if $obvious_hiding_player
+        return true if $obvious_hiding_player
+        GameObj.npcs.each { |i| return true if i.type =~ /companion/ && i.name !~ /#{$companion}/i }
         GameObj.npcs.each { |i| return true if i.type =~ /familiar/ && i.name !~ /#{$familiar}/i }
       end
       return false
@@ -1807,8 +2039,14 @@ class Bigshot
     end
   end
 
+  def get_grouplist()
+    return $grouplist
+  end
+
   def should_flee?( just_entered = false )
+    echo "should_flee" if $bigshot_debug
     return false if $bigshot_quick
+    return false if $bigshot_bandits
     return true if $bigshot_flee
     GameObj.loot.each { |i| return true if i.noun =~ /cloud|breath/ } if @FLEE_CLOUDS
     GameObj.loot.each { |i| return true if i.name == 'intense shimmering circle' } if @FLEE_CLOUDS
@@ -1818,7 +2056,7 @@ class Bigshot
     return true if checkpcs.any?      { |i| @ALWAYS_FLEE_FROM.include?(i) }
     return true if !leading? && checkpcs.empty?
 
-    npcs = GameObj.npcs.find_all { |i| i.status !~ /dead/ }
+    npcs = GameObj.npcs.find_all { |i| i.status !~ /dead|gone/ }
     npcs.delete_if { |npc| (@INVALID_TARGETS.include?(npc.name) or @INVALID_TARGETS.include?(npc.noun)) }
     npcs.delete_if { |npc| CharSettings['untargetable'].include?(npc.name) }
     npcs.delete_if { |npc| npc.noun =~ /child|traveller|scribe|merchant|dignitary|official|magistrate/i && npc.name !~ /ethereal|celestial|unworldly/i }
@@ -1833,42 +2071,57 @@ class Bigshot
   end
 
   def valid_target?( target, just_entered = false )
-    echo "valid_target?" if $bigshot_debug
+    echo "valid_target? (given #{target})" if $bigshot_debug
+    echo "return false if target == nil #{target == nil} || target == false #{target == false}" if $bigshot_debug
     return false if target == nil || target == false
+    echo "return false if should_flee?(just_entered) #{should_flee?(just_entered)}" if $bigshot_debug
     return false if should_flee?(just_entered)
+    echo " return false if just_entered #{just_entered} && poaching? #{poaching?}" if $bigshot_debug
     return false if just_entered && poaching?
+    echo " false if target.noun.... (not last one)" if $bigshot_debug
     return false if target.noun =~ /child|traveller|scribe|merchant|dignitary|official|magistrate/i && target.name !~ /ethereal|celestial|unworldly/i
 
-    if( !CharSettings['targetable'].include?(target.name) && !CharSettings['untargetable'].include?(target.name) && target.status !~ /dead/ )
+    if( !CharSettings['targetable'].include?(target.name) && !CharSettings['untargetable'].include?(target.name) && target.status !~ /dead|gone/ )
       result = dothistimeout( "target ##{target.id}", 3, /^You are now targeting|^You can't target/ )
       if( result =~ /^You are now targeting/ )
-        CharSettings['targetable'].push(target.name) if target.status !~ /dead/
+        CharSettings['targetable'].push(target.name) if target.status !~ /dead|gone/
       elsif( result =~ /^You can't target/ )
-        CharSettings['untargetable'].push(target.name) if target.status !~ /dead/
+        CharSettings['untargetable'].push(target.name) if target.status !~ /dead|gone/
       end
     end
+    echo "return false if CharSettings['untargetable'].include?(target.name)  #{CharSettings['untargetable'].include?(target.name)}" if $bigshot_debug
     return false if CharSettings['untargetable'].include?(target.name)
-    if (target.status !~ /dead/) and GameObj.npcs.any? { |n| n.id == target.id } and (@TARGETS.nil? or @TARGETS.keys.any? { |i| target.name =~ /#{i}/i or target.noun =~ /#{i}/i })
+    echo "return false if (target.status =~ /dead|gone/)  #{(target.status =~ /dead|gone/)}" if $bigshot_debug
+    return false if (target.status =~ /dead|gone/)
+    temp_var = !GameObj.npcs.any? { |n| n.id == target.id } #Exists solely for debug printout
+    echo "!GameObj.npcs.any? { |n| n.id == target.id }  #{temp_var}" if $bigshot_debug
+    return false if temp_var
+    if (@TARGETS.nil? or @TARGETS.keys.any? { |i| target.name =~ /#{i}/i or target.noun =~ /#{i}/i })
+      echo "returning true from valid_target for #{target.name}" if $bigshot_debug
       return true
     else
+      echo "Returning valid_target == false for #{target.name}" if $bigshot_debug
       return false
     end
   end
 
   def sort_npcs()
     echo "sort_npcs" if $bigshot_debug
-    if $bigshot_quick
+    if $bigshot_quick || $bigshot_bandits
       targets = Hash.new
       tokens = []
       if @QUICKHUNT_TARGETS.nil?
-        @QUICKHUNT_TARGETS = Hash.new 
+        @QUICKHUNT_TARGETS = Hash.new
         @QUICKHUNT_TARGETS["ZZTestZZ"]="ZZTestZZ"
       end
-      npcs = GameObj.npcs.find_all { |i| i.status !~ /dead/ }
+      npcs = GameObj.npcs.find_all { |i| i.status !~ /dead|gone/ }
       npcs.delete_if { |npc| CharSettings['untargetable'].include?(npc.name) }
       npcs.delete_if { |npc| npc.noun =~ /child|traveller|scribe|merchant|dignitary|official|magistrate/i && npc.name !~ /ethereal|celestial|unworldly/i }
+      if ($bigshot_bandits)
+        npcs.delete_if { |npc| npc.noun !~ /thief|rogue|bandit|mugger|outlaw|highwayman|marauder|brigand|thug|robber/i && npc.name !~ /ethereal|celestial|unworldly/i }
+      end
       npcs.each {|i| tokens.push(i.name)}
-      tokens.uniq.each {|i| 
+      tokens.uniq.each {|i|
         if i =~ /#{@QUICKHUNT_TARGETS.keys.join('|')}/i
           next
         else
@@ -1890,12 +2143,11 @@ class Bigshot
 
   def priority(target)
     echo "priority" if $bigshot_debug
-    echo "priority check: #{(!$current_room_npcs.zip($room_npcs_last_check).map{|x,y| x.id==y.id}.any?{|s| s == false})}" if $bigshot_debug
     return true if (!$current_room_npcs.zip($room_npcs_last_check).map{|x,y| x.id==y.id}.any?{|s| s == false})
     $room_npcs_last_check = GameObj.npcs
     priority = false
     stoppriority = false
-    npcs = GameObj.npcs.find_all { |i| i.status !~ /dead/ }
+    npcs = GameObj.npcs.find_all { |i| i.status !~ /dead|gone/ }
     npcs.delete_if { |npc| CharSettings['untargetable'].include?(npc.name) }
     npcs.delete_if { |npc| npc.noun =~ /child|traveller|scribe|merchant|dignitary|official|magistrate/i && npc.name !~ /ethereal|celestial|unworldly/i }
     @TARGETS.keys.each{|t|
@@ -1919,11 +2171,13 @@ class Bigshot
     echo "find_target" if $bigshot_debug
     return target if valid_target?(target, just_entered)
 
-    if @PRIORITY
+    if @PRIORITY && !$bigshot_bandits
+      echo "@PRIORITY && !$bigshot_bandits" if $bigshot_debug
       sort_npcs.each { |i| return i if valid_target?( i, just_entered ) && priority(i)  }
     else
       sort_npcs.each { |i| return i if valid_target?( i, just_entered ) }
     end
+    echo "\n\n\nfind target returning nil\n\n\n" if $bigshot_debug
     return nil
   end
 
@@ -1955,7 +2209,7 @@ class Bigshot
   end
 
   def set_help_group( keep_attacking )
-    @help_group_kill = keep_attacking
+    @HELP_GROUP_KILL = keep_attacking
   end
 
   def lte_boost?()
@@ -1976,9 +2230,9 @@ class Bigshot
         elsif boost_attempt =~ /You have deducted 500 experience points from your field experience/
           $bigshot_lte_boost_counter += 1
           message("Used LTE Boost: #{$bigshot_lte_boost_counter} of #{@LTE_BOOST}")
-          $bigshot_overkill_counter = 0 
+          $bigshot_overkill_counter = 0
         end
-    end  
+    end
   end
 
   def ammo_on_ground(ammo)
@@ -2056,6 +2310,7 @@ class Bigshot
   end
 
   def wounded?()
+    echo "wounded?" if $bigshot_debug
     if $bigshot_quick
       return false
     elsif(@WOUNDED_EVAL)
@@ -2099,6 +2354,7 @@ class Bigshot
   end
 
   def should_rest?()
+    echo "should_rest?" if $bigshot_debug
     if($bigshot_quick)
       return false
     elsif($bigshot_should_rest)
@@ -2117,8 +2373,8 @@ class Bigshot
       $rest_reason = "emergency rest."
       $bigshot_status = :resting
       return true
-    elsif ( !solo? && !leading? && $bigshot_status != :resting && @help_group_kill )
-      return false if !oom?  
+    elsif ( !solo? && !leading? && @HELP_GROUP_KILL )
+      return false if !oom?
     end
 
     if (leading? && !solo? && fried? && overkill? && lte_boost? )
@@ -2143,6 +2399,9 @@ class Bigshot
     end
 
     $rest_reason = "none."
+    if (!solo? && leading?)
+      @followers.group_assist( true )
+    end
     return false
   end
 
@@ -2151,11 +2410,11 @@ class Bigshot
       $bigshot_overkill_counter += 1
       message("Extra Kills currently at: #{$bigshot_overkill_counter} of #{@OVERKILL}")
     end
-    
+
     if (!solo? && leading?)
       @followers.add_event(:FOLLOWER_OVERKILL)
-    end  
-  end  
+    end
+  end
 
   def cast_signs(single_cast = false)
     echo "cast_signs?" if $bigshot_debug
@@ -2227,6 +2486,14 @@ class Bigshot
     end
   end
 
+  def reset_obvious_hiding_player()
+    $obvious_hiding_player = false
+    if ( !solo? && leading? )
+      @followers.obv_hide_reset()
+    end
+
+  end
+
   def prepare_for_movement()
     echo "prepare_for_movement" if $bigshot_debug
     reset_variables()
@@ -2267,24 +2534,23 @@ class Bigshot
     }
 
     while true  # wander, check for players
-      reset_variables()
-      change_stance('defensive')
+      prepare_for_movement()
       exit if $bigshot_quick
       npcs = GameObj.npcs
-      npcs.delete_if { |npc| (npc.status =~ /dead/) }
+      npcs.delete_if { |npc| (npc.status =~ /dead|gone/) }
       sort_npcs.each{ |i| return i if valid_target?( i, true ) and no_players == true and (GameObjNpcCheck() > 0) }
       return if should_rest?
-      $obvious_hiding_player = false
+      reset_obvious_hiding_player()
       wander.call
       sleep(0.1)
       $bigshot_flee = false
     end
   end
 
-  def CompanionCheck() 
+  def CompanionCheck()
     if ( Char.prof =~ /Ranger/i && Spell[630].known? && GameObj.npcs.any?{|i| i.type =~ /companion/} && $companion == nil )
       npcs = GameObj.npcs.find_all { |i| i.type =~ /companion/i }
-      npcs.each {|i| 
+      npcs.each {|i|
         res = dothistimeout "lean ##{i.id}", 1, /your direction in acknowledgement|rubbing.*gently|while it is flying|You lean toward/i
         if res =~ /rubbing.*gently/i
           $companion = i.name
@@ -2335,11 +2601,11 @@ class Bigshot
     script.want_downstream_xml = restore_want_downstream_xml
     clear
     find_all_containers_var = container_ids.collect { |id| GameObj[id] }
-    find_all_containers_var.each{|i| 
+    find_all_containers_var.each{|i|
       if i.contents.nil?
         fput "look in ##{i.id}"
       end
-      i.contents.each{|s| 
+      i.contents.each{|s|
         if s.name =~ /alfange|basilard|bodkin|cinquedea|dagger|dirk|knife|kozuka|ice pick|misericord|parazonium|pavade|poignard|pugio|scramasax|sgian achlais|spike|stiletto|tanto|sidearm-of-Onar/i
           fput "_drag ##{s.id} right"
           while !checkroom("The Belly of the Beast").nil?
@@ -2398,27 +2664,51 @@ class Bigshot
     end
   end
 
+  def group_put(message)
+    echo "group_put" if $bigshot_debug
+    bs_put(message)
+  end
+
+  def group_cmd(message)
+    echo "group_cmd" if $bigshot_debug
+    cmd(message)
+  end
+
+  def group_do(message)
+    echo "group_do" if $bigshot_debug
+    do_client(message)
+  end
+
   # gui
   def self.setup
+    def self.gtk3_active?
+      Gtk::Version::STRING.chr == '3' ? true : false
+    end
+
+    def self.add_vbox
+      Bigshot.gtk3_active? ? Gtk::Box.new(:vertical, 0) : Gtk::VBox.new(false, 0)
+    end
+
     Gtk.queue {
       $OP_WINDOW = Gtk::Window.new
       $OP_WINDOW.title = "Big Shot: v#{BIGSHOT_VERSION}"
+      $OP_WINDOW.set_icon(@default_icon)
       $OP_WINDOW.set_border_width(10)
       $OP_WINDOW.keep_above = true
-      $OP_BOX = Gtk::VBox.new(false)
+      $OP_BOX = Bigshot.add_vbox
       $OP_BOX.set_border_width(5)
 
-      $OP_VERTICAL_BOX1 =  Gtk::VBox.new(false, 0)
-      $OP_VERTICAL_BOX2 =  Gtk::VBox.new(false, 0)
-      $OP_VERTICAL_BOX3 =  Gtk::VBox.new(false, 0)
-      $OP_VERTICAL_BOX4 =  Gtk::VBox.new(false, 0)
-      $OP_VERTICAL_BOX5 =  Gtk::VBox.new(false, 0)
-      $OP_VERTICAL_BOX6 =  Gtk::VBox.new(false, 0)
-      $OP_VERTICAL_BOX7 =  Gtk::VBox.new(false, 0)
-      $OP_VERTICAL_BOX8 =  Gtk::VBox.new(false, 0)
-      $OP_VERTICAL_BOX9 =  Gtk::VBox.new(false, 0)
-      $OP_VERTICAL_BOX10 = Gtk::VBox.new(false, 0)
-      $OP_VERTICAL_BOX11 = Gtk::VBox.new(false, 0)
+      $OP_VERTICAL_BOX1  = Bigshot.add_vbox
+      $OP_VERTICAL_BOX2  = Bigshot.add_vbox
+      $OP_VERTICAL_BOX3  = Bigshot.add_vbox
+      $OP_VERTICAL_BOX4  = Bigshot.add_vbox
+      $OP_VERTICAL_BOX5  = Bigshot.add_vbox
+      $OP_VERTICAL_BOX6  = Bigshot.add_vbox
+      $OP_VERTICAL_BOX7  = Bigshot.add_vbox
+      $OP_VERTICAL_BOX8  = Bigshot.add_vbox
+      $OP_VERTICAL_BOX9  = Bigshot.add_vbox
+      $OP_VERTICAL_BOX10 = Bigshot.add_vbox
+      $OP_VERTICAL_BOX11 = Bigshot.add_vbox
 
       $OP_WINDOW.add($OP_BOX)
       $OP_NOTEBOOK = Gtk::Notebook.new
@@ -2444,57 +2734,58 @@ class Bigshot
       $OP_TABLE1 = Gtk::Table.new(6, 3, false)
       $OP_TABLE1.row_spacings=3
       $OP_TABLE1.column_spacings=3
-      $OP_VERTICAL_BOX1.pack_start($OP_TABLE1, false, false, 0)
+      $OP_VERTICAL_BOX1.pack_start($OP_TABLE1, :expand => false, :fill => false, :padding => 0)
 
       $OP_TABLE2 = Gtk::Table.new(6, 3, false)
       $OP_TABLE2.row_spacings=3
       $OP_TABLE2.column_spacings=3
-      $OP_VERTICAL_BOX2.pack_start($OP_TABLE2, false, false, 0)
+      $OP_VERTICAL_BOX2.pack_start($OP_TABLE2, :expand => false, :fill => false, :padding => 0)
 
       $OP_TABLE3 = Gtk::Table.new(6, 3, false)
       $OP_TABLE3.row_spacings=3
       $OP_TABLE3.column_spacings=3
-      $OP_VERTICAL_BOX3.pack_start($OP_TABLE3, false, false, 0)
+      $OP_VERTICAL_BOX3.pack_start($OP_TABLE3, :expand => false, :fill => false, :padding => 0)
 
       $OP_TABLE4 = Gtk::Table.new(6, 3, false)
       $OP_TABLE4.row_spacings=3
       $OP_TABLE4.column_spacings=3
-      $OP_VERTICAL_BOX4.pack_start($OP_TABLE4, false, false, 0)
+      $OP_VERTICAL_BOX4.pack_start($OP_TABLE4, :expand => false, :fill => false, :padding => 0)
 
       $OP_TABLE5 = Gtk::Table.new(6, 3, false)
       $OP_TABLE5.row_spacings=3
       $OP_TABLE5.column_spacings=3
-      $OP_VERTICAL_BOX5.pack_start($OP_TABLE5, false, false, 0)
+      $OP_VERTICAL_BOX5.pack_start($OP_TABLE5, :expand => false, :fill => false, :padding => 0)
 
       $OP_TABLE6 = Gtk::Table.new(6, 3, false)
       $OP_TABLE6.row_spacings=1
       $OP_TABLE6.column_spacings=1
-      $OP_VERTICAL_BOX6.pack_start($OP_TABLE6, false, false, 0)
+      $OP_VERTICAL_BOX6.pack_start($OP_TABLE6, :expand => false, :fill => false, :padding => 0)
 
       $OP_TABLE7 = Gtk::Table.new(6, 3, false)
       $OP_TABLE7.row_spacings=3
       $OP_TABLE7.column_spacings=3
-      $OP_VERTICAL_BOX7.pack_start($OP_TABLE7, false, false, 0)
+      $OP_VERTICAL_BOX7.pack_start($OP_TABLE7, :expand => false, :fill => false, :padding => 0)
 
       $OP_TABLE8 = Gtk::Table.new(6, 3, false)
       $OP_TABLE8.row_spacings=3
       $OP_TABLE8.column_spacings=3
-      $OP_VERTICAL_BOX8.pack_start($OP_TABLE8, false, false, 0)
+
+      $OP_VERTICAL_BOX8.pack_start($OP_TABLE8, :expand => false, :fill => false, :padding => 0)
 
       $OP_TABLE9 = Gtk::Table.new(6, 3, false)
       $OP_TABLE9.row_spacings=3
       $OP_TABLE9.column_spacings=3
-      $OP_VERTICAL_BOX9.pack_start($OP_TABLE9, false, false, 0)
+      $OP_VERTICAL_BOX9.pack_start($OP_TABLE9, :expand => false, :fill => false, :padding => 0)
 
       $OP_TABLE10 = Gtk::Table.new(6, 3, false)
       $OP_TABLE10.row_spacings=3
       $OP_TABLE10.column_spacings=3
-      $OP_VERTICAL_BOX10.pack_start($OP_TABLE10, false, false, 0)
+      $OP_VERTICAL_BOX10.pack_start($OP_TABLE10, :expand => false, :fill => false, :padding => 0)
 
       $OP_TABLE11 = Gtk::Table.new(6, 3, false)
       $OP_TABLE11.row_spacings=3
       $OP_TABLE11.column_spacings=3
-      $OP_VERTICAL_BOX11.pack_start($OP_TABLE11, false, false, 0)
+      $OP_VERTICAL_BOX11.pack_start($OP_TABLE11, :expand => false, :fill => false, :padding => 0)
     }
 
     def self.add_label_entry(table, label, variable)
@@ -2519,7 +2810,7 @@ class Bigshot
       size = $OP_TABLE_SIZE[table] || 0
       i = 0
       label = Gtk::Label.new(dropdown)
-      dropdown = Gtk::ComboBox.new
+      Bigshot.gtk3_active? ? dropdown = Gtk::ComboBoxText.new : dropdown = Gtk::ComboBox.new
       options.split(',').each{|s|
         dropdown.append_text(s)
       }
@@ -2580,7 +2871,6 @@ class Bigshot
       add_label_entry($OP_TABLE6, "quick hunting commands:", 'quick_commands')
       add_label_entry($OP_TABLE7, "Tier 3 Attack", 'tier3')
       add_label_entry($OP_TABLE7, "Aim at location (head, etc)", 'aim')
-      add_label_entry($OP_TABLE7, "MSTRIKE when creatures equal or greater", 'uac_mstrike')
       add_label_entry($OP_TABLE8, "MSTRIKE during cooldown stamina requirement", 'mstrike_stamina_cooldown')
       add_label_entry($OP_TABLE8, "QUICKSTRIKE stamina requirement", 'mstrike_stamina_quickstrike')
       add_label_entry($OP_TABLE8, "Unfocused MSTRIKE when creatures equal or greater", 'mstrike_mob')
@@ -2604,7 +2894,7 @@ class Bigshot
       size = $OP_TABLE_SIZE[table] || 0
       checkbox = Gtk::CheckButton.new label
       value = UserVars.op[variable].nil? ? default : UserVars.op[variable]
-      checkbox.set_active(value)
+      checkbox.active = value
       table.attach(checkbox, x_pos, x_pos + 1, size, size + 1)
       $OP_ENTRY[variable] = checkbox
       $OP_TABLE_SIZE[table] += 1 if x_pos == 1
@@ -2615,6 +2905,7 @@ class Bigshot
       add_checkbox($OP_TABLE1,  1, "Monitor interaction", 'monitor_interaction')
       add_checkbox($OP_TABLE1,  0, "Depart/rerun if dead", 'depart_switch')
       add_checkbox($OP_TABLE1,  1, "Flee from clouds", 'flee_clouds')
+      add_checkbox($OP_TABLE1,  0, "Quiet followers", 'quiet_followers', true)
       add_checkbox($OP_TABLE1,  1, "Flee from vines", 'flee_vines')
       add_checkbox($OP_TABLE1,  1, "Flee from webs", 'flee_webs')
       add_checkbox($OP_TABLE4,  0, "Priority hunt", 'priority')
@@ -2639,8 +2930,6 @@ class Bigshot
     }
 
     Gtk.queue {
-      $OP_TOOLTIPS = Gtk::Tooltips.new.enable
-
       label = Gtk::Label.new
       label.set_markup("<i>Bigshot is the leader of the Battle Patrol.\nHe comes equipped with a gun as long as his entire superstructure.\nTakes the edge off.\n\n\n***Settings with * are required.***</i>")
       align = Gtk::Alignment.new(1, 0, 0, 0)
@@ -2650,44 +2939,47 @@ class Bigshot
 
       commands_tip =  "Example 1: 413 target, 903 target\nExample 2: 903 target(x2)\nExample 3: 903 target(xx)\nExample 4: 910 target(m50), 903 target\nExample 5: unarmed punch, wait 30\nExample 1 will cast 413 then 903 on the target. Example 2 will cast 903 on the target twice. Example 3 will cast 903 on the target until the fight is over. Example 4 will cast 910 if mana is at least 50, otherwise it will cast 903. Example 5 will start the unarmed routine with punch as the main attack. It will attack once, then wait 30 seconds for another attack to happen before attacking again.\nSeparate all commands with commas.\n\nNew feature: 'and'.\nFor example: stance def and 1615 target, kill target(xx)"
       disable_tip = "If left blank and this character is in a bigshot group, character will continue to use standard hunting commands after mind is fried and overkill limit is reached\nIf row populated, and character is in a bigshot group, these commands will be used instead of standard hunting commands once fried and overkill limit reached\nSee hunting commands tooltip for examples on what commands to use."
-      $OP_TOOLTIPS.set_tip($OP_ENTRY['hunting_commands'], commands_tip, "")
-      $OP_TOOLTIPS.set_tip($OP_ENTRY['hunting_commands_g'], commands_tip, "")
-      $OP_TOOLTIPS.set_tip($OP_ENTRY['disable_commands'], disable_tip, "")
+      $OP_ENTRY['hunting_commands'].set_tooltip_text(commands_tip)
+	    $OP_ENTRY['hunting_commands_g'].set_tooltip_text(commands_tip)
+	    $OP_ENTRY['disable_commands'].set_tooltip_text(disable_tip)
+
+      quiet_followers_tip = "Followers will wait until Leader is done with both actions and resting scripts to begin using their own\n\nUse Case: Prevents you from looking like you have mindless bots following while selling loot"
+      $OP_ENTRY['quiet_followers'].set_tooltip_text(quiet_followers_tip)
 
       signs_tip = "Shadow Mastery - 9603\nSurge of Strength - 9605\n\nSigil of Contact - 9703\nSigil of Resolve - 9704\nSigil of Minor Bane - 9705\nSigil of Defense - 9707\nSigil of Offense - 9708\nSigil of Minor Protection - 9710\nSigil of Focus - 9711\nSigil of Mending - 9713\nSigil of Concentration - 9714\nSigil of Major Bane - 9715\nSigil of Major Determination - 9716\nSigil of Major Protection - 9719\n\nSign of Warding - 9903\nSign of Striking - 9904\nSign of Thought - 9906\nSign of Defending - 9907\nSign of Smiting - 9908\nSign of Staunching - 9909\nSign of Deflection - 9910\nSign of Swords - 9912\nSign of Shields - 9913\nSign of Dissipation - 9914\nSign of Madness - 9916\n\nSymbol of Courage - 9805\nSymbol of Protection - 9806"
-      $OP_TOOLTIPS.set_tip($OP_ENTRY['signs'], signs_tip, "")
+      $OP_ENTRY['signs'].set_tooltip_text(signs_tip)
 
       aim_tip = "Leave blank if you don't want to aim at anything\n\nSuggest leaving chest as last thing to aim at so you will always have something to hit"
-      $OP_TOOLTIPS.set_tip($OP_ENTRY['aim'], aim_tip, "")
-      $OP_TOOLTIPS.set_tip($OP_ENTRY['archery_aim'], aim_tip, "")
+      $OP_ENTRY['aim'].set_tooltip_text(aim_tip)
+      $OP_ENTRY['archery_aim'].set_tooltip_text(aim_tip)
 
       mstrike_tip = "Set this to the highest you want your stamina to be before you MSTRIKE.\nImportant if MSTRIKEing during its cooldown or while using QUICKSTRIKE.\nLeave blank to use max stamina variable instead\nCombination of QUICKSTRIKE and MSTRIKE during cooldown may pop muscles.\nIve done best I can to ensure it doesn't happen, but depends on what you set your MSTRIKE stamina to.\n\nWorks in conjunction with MSTRIKE creature #, so if you meet the requirements for it and not this one you will MSTRIKE and visaversa."
-      $OP_TOOLTIPS.set_tip($OP_ENTRY['mstrike_stamina_cooldown'], mstrike_tip, "")
-      $OP_TOOLTIPS.set_tip($OP_ENTRY['mstrike_stamina_quickstrike'], mstrike_tip, "")
+      $OP_ENTRY['mstrike_stamina_cooldown'].set_tooltip_text(mstrike_tip)
+      $OP_ENTRY['mstrike_stamina_quickstrike'].set_tooltip_text(mstrike_tip)
 
       mstrike_mob_tip = "How many creatures you want in the room before you perform an unfocused MSTRIKE.\nDefault is 2. Set to 1 to always do an unfocused MSTRIKE."
-      $OP_TOOLTIPS.set_tip($OP_ENTRY['mstrike_mob'], mstrike_mob_tip, "")
+      $OP_ENTRY['mstrike_mob'].set_tooltip_text(mstrike_mob_tip)
 
       bless_tip = "Will bless whatever item ran out of blessing.\nWill do 304 if known or Symbol of Bless otherwise.\nIf you can do neither of those will rest and exit the script."
-      $OP_TOOLTIPS.set_tip($OP_ENTRY['bless'], bless_tip, "")
+      $OP_ENTRY['bless'].set_tooltip_text(bless_tip)
 
       priority_tip = "Priority is based on order of valid targets box on hunting tab. Will switch to highest priority in room when attacking."
-      $OP_TOOLTIPS.set_tip($OP_ENTRY['priority'], priority_tip, "")
+	    $OP_ENTRY['priority'].set_tooltip_text(priority_tip)
 
       smite_tip = "Will SMITE a non-corporeal undead when tier is excellent during UAC Combat"
-      $OP_TOOLTIPS.set_tip($OP_ENTRY['uac_smite'], smite_tip, "")
+      $OP_ENTRY['uac_smite'].set_tooltip_text(smite_tip)
 
       flee_tip = "Input any text that when the game sends you want to move out of the room from\nlike a Roa'ter burrow attack \"You feel a rumble come from beneath your feet.\"\nSeperate different messages with a | in between them."
-      $OP_TOOLTIPS.set_tip($OP_ENTRY['flee_message'], flee_tip, "")
+      $OP_ENTRY['flee_message'].set_tooltip_text(flee_tip)
 
       fog_tip = "None: Dont use any fog options when you return from a hunt\n\nSpirit Guide(130): Use 130 first, then if that fails Symbol of Return\n\nVoln Symbol of Return: Use Symbol of Return first, then if that fails 130\n\nTraveler's Song(1020): Use 1020 only"
-      $OP_TOOLTIPS.set_tip($OP_ENTRY['fog_return'], fog_tip, "")
+      $OP_ENTRY['fog_return'].set_tooltip_text(fog_tip)
 
       fried_tip = "Percentage of your mind (0-100) after which you will stop hunting.\n  101\t will hunt until mana/encumbrance/wounded\n  100\tis fully fried"
-      $OP_TOOLTIPS.set_tip($OP_ENTRY['fried'], fried_tip, "")
+      $OP_ENTRY['fried'].set_tooltip_text(fried_tip)
 
       overkill_tip = "This is the number of additional monsters to kill after reaching your fried threshold.\n  0    \tWill not kill extra monsters\n  3-5\trecommended to ensure true 100% fried state"
-      $OP_TOOLTIPS.set_tip($OP_ENTRY['overkill'], overkill_tip, "")
+      $OP_ENTRY['overkill'].set_tooltip_text(overkill_tip)
 
       size = $OP_TABLE_SIZE[$OP_TABLE3]
       label = Gtk::Label.new
@@ -2751,6 +3043,7 @@ class Bigshot
       $OP_WINDOW.destroy
     }
   end
+
   def self.profile(vars)
     if vars[2] =~ /load/i
       if vars[3] != nil
@@ -2843,17 +3136,26 @@ elsif( script.vars[1] =~ /head|lead/i )
   pause 3
   bs.lead(my_group)
 
-elsif( script.vars[1] =~ /tail|follow/i )
+elsif( script.vars[1] =~ /tail|follow|link/i )
   # Watch for rally
   group = nil
   bs = nil
+  uri = nil
   while( group.nil? && bs.nil? )
+    if (script.vars[1] =~ /link/i && script.vars[2].nil?)
+      echo "Must supply target URI when using LINK option"
+      exit 
+    end
     echo "waiting for rally" if $bigshot_debug
-    if( get =~ /rallying at (.*)\."$/ )
-
+    if (script.vars[1] =~ /link/i )
+      uri = script.vars[2]
+    end
+    if( !uri.nil? || get =~ /rallying at (.*)\."$/ ) 
+      uri = (uri.nil?) ? $1 : uri
+      fput "whisper ooc group Bigshot rallying at #{uri}" unless script.vars[1] =~ /link/i
       # create group
       DRb.start_service()
-      group = DRbObject.new( nil, $1 )
+      group = DRbObject.new( nil, uri )
 
       # create Bigshot
       bs = Bigshot.new()
@@ -2867,7 +3169,7 @@ elsif( script.vars[1] =~ /tail|follow/i )
   # Participate
   bs.message("Joined group")
   leader = group.leader.name
- $bigshot_overkill_counter = 0
+  $bigshot_overkill_counter = 0
 
   bs.groupcheck() if !checkpcs.nil?
   echo "Groupcheck done" if $bigshot_debug
@@ -2883,15 +3185,18 @@ elsif( script.vars[1] =~ /tail|follow/i )
       next if event.nil?
 
       # kertwang!
-      until( checkpcs.include?(leader) )
-        start_script( 'go2', [ group.room_id, '_disable_confirm_' ] )
-        wait_while { running?('go2') }
-        fput "join #{leader}"
-        sleep(1)
+      if ( event.type != :STAY_QUIET )
+        until( checkpcs.include?(leader) )
+          break if Char.name == leader
+          start_script( 'go2', [ group.room_id, '_disable_confirm_' ] )
+          wait_while { running?('go2') }
+          fput "join #{leader}"
+          sleep(1)
+        end
       end
 
       # process event
-      bs.message("event: " + event.type.to_s)
+      bs.message("event: " + event.type.to_s) unless event.type == :FOLLOWER_OVERKILL || event.type == :PREP_REST
       if( event.type == :HUNTING_PREP_COMMANDS )
         bs.HUNTING_PREP_COMMANDS.each { |i|
           if i =~ /^script\s+(.*?)(\s|$)(.*)/i
@@ -2900,6 +3205,21 @@ elsif( script.vars[1] =~ /tail|follow/i )
             fput(i)
           end
         }
+
+      elsif( event.type == :STAY_QUIET )
+        next if Char.name == leader
+        #If they got left somewhere besides the resting room, put them in a known (and hopefully safe) location
+        if (Room.current.id != group.resting_id)
+          bs.goto(group.resting_id)
+          wait_while { running?('go2') }
+        end
+        bs.message("Waiting for Bigshot leader to finish running resting scripts")
+        loop do
+          break if Char.name == leader
+          sleep( REST_INTERVAL )
+          break if checkpcs.include?(leader) && Room.current.id == group.resting_id
+        end
+        fput "join #{leader}"
 
       elsif( event.type == :FOLLOWER_OVERKILL )
         bs.use_lte_boost()
@@ -2916,13 +3236,41 @@ elsif( script.vars[1] =~ /tail|follow/i )
           next
         end
 
-        target = nil
-        while( target = bs.find_target(target))
-          next if event.type == :PREP_REST
 
-          target = bs.find_target(nil) if @PRIORITY && !bs.priority(target)
-          bs.attack(target)
+        stop_attack = false
+        target = nil
+        while(!stop_attack)
+          stop_attack = event.stale?
+          while( (target = bs.find_target(target)) && !stop_attack )
+            if( bs.event_stack.any? { |a| a.type == :PREP_REST} )
+              bs.message("Preparing to move, skipping attack")
+              stop_attack = true
+              break
+            end
+
+            target = bs.find_target(nil) if !$bigshot_bandits && @PRIORITY && !bs.priority(target)
+            bs.attack(target)
+
+            until( checkpcs.include?(leader) )
+              break if Char.name == leader
+              start_script( 'go2', [ group.room_id, '_disable_confirm_' ] )
+              wait_while { running?('go2') }
+              fput "join #{leader}"
+              sleep(1)
+            end
+
+            stop_attack = bs.should_rest?
+          end
+          break if stop_attack
+          stop_attack = bs.event_stack.any? { |a| a.type == :PREP_REST}
+          sleep(0.3)
         end
+
+      elsif( event.type == :PREP_REST )
+        bs.prepare_for_movement()
+
+      elsif ( event.type == :LOOT )
+        bs.loot
 
       elsif( event.type == :HUNTING_SCRIPTS_STOP )
         bs.croak_scripts(bs.HUNTING_SCRIPTS)
@@ -2930,12 +3278,15 @@ elsif( script.vars[1] =~ /tail|follow/i )
       elsif( event.type == :RESTING_PREP_COMMANDS )
         $bigshot_should_rest = nil # need to reset this
         $bigshot_overkill_counter = 0
+        next if Char.name == leader
         bs.RESTING_COMMANDS.each { |i| fput(i) }
 
       elsif( event.type == :RESTING_SCRIPTS_START )
+        next if Char.name == leader
         bs.run_scripts( bs.RESTING_SCRIPTS, true )
 
       elsif( event.type == :DISPLAY_WATCH )
+        next if Char.name == leader
         if( event.stale? )
           bs.message("skipping display_watch because it's stale")
           next
@@ -2944,6 +3295,18 @@ elsif( script.vars[1] =~ /tail|follow/i )
         bs.message( "Bigshot last rested because: #{$rest_reason}" ) if $rest_reason
         bs.message( "Bigshot isn't hunting because: #{$not_hunting_reason}" ) if $not_hunting_reason
         sleep( REST_INTERVAL / 10 )
+
+      elsif ( event.type == :CUSTOM_PUT )
+        bs.group_put(event.cmd_input)
+
+      elsif ( event.type == :CUSTOM_CMD )
+        bs.group_cmd(event.cmd_input)
+
+      elsif ( event.type == :CUSTOM_DO_CLIENT )
+        bs.group_do(event.cmd_input)
+
+      elsif ( event.type == :PUBLIC_SEND )
+        echo "SENT: #{bs.public_send(event.cmd_input) if bs.respond_to? event.cmd_input}"
       end
 
     rescue
